@@ -31,6 +31,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsPP,
     _require_is_multimodal,
 )
 from .utils import (
@@ -72,10 +73,19 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-        )
+        # devfactor P4 (MTP+PP): embed_tokens (here ~2.37 GiB for Qwen3.6) is only
+        # used in forward() on the first PP rank (to embed the draft tokens before
+        # the fc concat). On other ranks it is dead weight. Under PP it landed
+        # whole on the LAST rank (where the drafter lives) and OOM'd a 16 GiB GPU.
+        # Instantiate it only on the first rank (PPMissingLayer elsewhere), matching
+        # the target model's layout. See docs/vllm-mtp-pipeline-parallel-plan.md (A3).
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
@@ -346,7 +356,13 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
-class Qwen3_5MTP(nn.Module, SupportsMultiModal):
+class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
+    # devfactor P4: the draft MTP forward is already PP-aware (handles
+    # is_first_rank/is_last_rank, returns IntermediateTensors, provides
+    # make_empty_intermediate_tensors) but the class never declared SupportsPP,
+    # so config/model.py:1207 rejected pipeline_parallel_size>1 at startup.
+    # Declaring it lets MTP+PP pass the config guard. See
+    # docs/vllm-mtp-pipeline-parallel-plan.md (Verrou A / Étape A1).
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
