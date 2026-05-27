@@ -4554,8 +4554,9 @@ class GPUModelRunner(
         # `prev_sampled_token_ids` is [num_reqs, 1] (non-spec via
         # `_bookkeeping_sync` 3625, spec via `_copy_valid_sampled_token_count`
         # 4749) and `_draft_token_ids` is [num_reqs, num_spec]. The broadcast
-        # bundles them as [num_reqs, 1 + num_spec] so earlier ranks (which have
-        # no local drafter) can fill their spec input positions.
+        # bundles them (plus the valid-sampled-token count, bug #6) as
+        # [num_reqs, 2 + num_spec] so earlier ranks (which have no local drafter)
+        # can fill their spec input positions and correct their num_computed.
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -4665,15 +4666,24 @@ class GPUModelRunner(
         assert pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
         num_spec = self.num_spec_tokens
-        # devfactor #18019: broadcast a SINGLE bundled tensor
-        # [num_reqs, 1 + num_spec] = [confirmed_token | draft_tokens] in one
-        # collective. A single fixed-shape collective (vs two) is deadlock-proof:
-        # the receiver always matches it without a handshake, regardless of
-        # whether the drafter ran. Column 0 is the confirmed token; columns
-        # 1..num_spec are the draft tokens earlier ranks need to fill their spec
-        # input positions (they have no local drafter).
+        # devfactor #18019 / bug #6: broadcast a SINGLE bundled tensor
+        # [num_reqs, 2 + num_spec] = [confirmed_token | valid_count | draft_tokens]
+        # in one collective. A single fixed-shape collective (vs two) is
+        # deadlock-proof: the receiver always matches it without a handshake,
+        # regardless of whether the drafter ran. Column 0 is the confirmed token;
+        # column 1 is the per-request valid-sampled-token count (= 1 + accepted).
+        # Bug #6: under async spec decode the scheduler feeds an OPTIMISTIC
+        # num_computed_tokens (all drafts assumed accepted); the last rank fixes
+        # it on GPU via `update_num_computed_tokens_for_batch_change` keyed off
+        # `valid_sampled_token_count_gpu`. Earlier ranks have no sampler so that
+        # count is None there and they keep the optimistic positions, drifting
+        # ahead by the cumulative rejected-draft count -> wrong RoPE/attention
+        # positions -> garbage hidden states. Broadcasting the count lets them run
+        # the same correction. Columns 2..(1+num_spec) are the draft tokens earlier
+        # ranks need to fill their spec input positions (they have no local
+        # drafter).
         bundle = torch.zeros(
-            (num_reqs, 1 + num_spec), dtype=torch.int32, device=self.device
+            (num_reqs, 2 + num_spec), dtype=torch.int32, device=self.device
         )
         sampled_token_ids = self.input_batch.prev_sampled_token_ids
         if sampled_token_ids is not None:
@@ -4681,9 +4691,15 @@ class GPUModelRunner(
                 "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
             )
             bundle[:, :1] = sampled_token_ids.to(dtype=torch.int32)
+        # Column 1: valid-sampled-token count (= 1 + accepted), identical to
+        # `num_accepted_tokens.gpu` computed in `_update_states_after_model_execute`
+        # for hybrid models. Defaults to 1 for non-spec steps (harmless).
+        bundle[:, 1:2] = (
+            self.num_accepted_tokens.gpu[:num_reqs].to(dtype=torch.int32).unsqueeze(1)
+        )
         if num_spec and torch.is_tensor(self._draft_token_ids):
             draft = self._draft_token_ids.to(dtype=torch.int32)
-            bundle[:, 1 : 1 + num_spec] = draft[:, :num_spec]
+            bundle[:, 2 : 2 + num_spec] = draft[:, :num_spec]
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast. devfactor #18019: use the
         # rank-invariant prefill check (NOT `_is_all_reqs_chunked_prefill`, whose
@@ -4700,20 +4716,39 @@ class GPUModelRunner(
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
         num_spec = self.num_spec_tokens
-        # devfactor #18019: receive the single bundled [num_reqs, 1 + num_spec]
-        # tensor (see the send side). Column 0 = confirmed token; the rest = the
+        # devfactor #18019 / bug #6: receive the single bundled
+        # [num_reqs, 2 + num_spec] tensor (see the send side). Column 0 =
+        # confirmed token; column 1 = valid-sampled-token count; the rest = the
         # draft tokens for the spec input positions.
         bundle = torch.empty(
-            (num_reqs, 1 + num_spec), dtype=torch.int32, device=self.device
+            (num_reqs, 2 + num_spec), dtype=torch.int32, device=self.device
         )
         recv = bundle[:, :1]
+        # Rank-invariant discard signal (bug #6, see prev_req_id_to_index below).
+        # Column 1 (valid count) is 0 iff the last rank discarded the request when
+        # sampling; >= 1 for any continuing request. Default to "all continuing"
+        # for the prefill-skip case where no broadcast happened.
+        valid_count_cpu: np.ndarray | None = None
         # skip for chunked prefill. devfactor #18019: rank-invariant prefill
         # check — must match the send side's guard exactly (see send side).
         if not self._is_all_reqs_still_prefilling():
             torch.distributed.broadcast(bundle, src=pp.last_rank, group=pp.device_group)
             recv = bundle[:, :1].contiguous()
+            valid_count_cpu = bundle[:, 1].to("cpu", dtype=torch.int32).numpy()
+            # bug #6: stash the broadcast valid-sampled-token count (= 1 +
+            # accepted) so `_prepare_inputs` runs the same on-GPU
+            # `update_num_computed_tokens_for_batch_change` correction the last
+            # rank runs. Without it this rank keeps the scheduler's optimistic
+            # (all-accepted) num_computed_tokens and its forward positions drift
+            # ahead of the last rank by the cumulative rejected-draft count,
+            # corrupting RoPE/attention positions and degrading output. The
+            # correction reads `num_computed_tokens[prev_positions] + valid_count`
+            # entirely on GPU, so a contiguous int32 [num_reqs] tensor is all the
+            # downstream `update_num_computed_tokens_for_batch_change` needs.
+            if self.use_async_spec_decode:
+                self.valid_sampled_token_count_gpu = bundle[:, 1].contiguous()
             if num_spec:
-                draft_recv = bundle[:, 1 : 1 + num_spec].contiguous()
+                draft_recv = bundle[:, 2 : 2 + num_spec].contiguous()
                 self._draft_token_ids = draft_recv
                 # Stash the received drafts keyed by req_id on CPU.
                 # `_update_states` uses them to overwrite the scheduler's -1 spec
@@ -4729,9 +4764,26 @@ class GPUModelRunner(
         self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
-        # can map req_id -> previous batch row
-        discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
-        discard_req_indices_set = set(discard_req_indices)
+        # can map req_id -> previous batch row.
+        # bug #6: the discard signal MUST be rank-invariant. `discard_request_mask`
+        # is `optimistic_seq_len < requests[r].num_tokens`, and `num_tokens` drifts
+        # between PP ranks under MTP (this rank advances output via -1 placeholders,
+        # the last rank via real acceptance) — using it here spuriously drops a
+        # continuing request from the map, so next step its `prev_positions` is -1,
+        # which skips BOTH the num_computed correction and the input_ids scatter →
+        # garbage positions/tokens on this rank. Instead use the broadcast valid
+        # count (column 1): it is exactly 0 iff the LAST RANK discarded the request
+        # while sampling, so it is identical on every rank by construction. Matches
+        # the last rank's own `prev_req_id_to_index` build (uses its sampling-side
+        # invalid_req_indices, _bookkeeping_sync ~3655).
+        if self.use_async_spec_decode and valid_count_cpu is not None:
+            discard_req_indices_set = {
+                i for i in range(num_reqs) if valid_count_cpu[i] == 0
+            }
+        else:
+            discard_req_indices_set = set(
+                np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
+            )
         prev_req_id_to_index: dict[str, int] = {}
         for i, req_id in enumerate(self.input_batch.req_ids):
             if i in discard_req_indices_set:

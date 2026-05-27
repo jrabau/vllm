@@ -305,12 +305,16 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
 def test_pp_broadcast_bundles_confirmed_and_draft_tokens_for_mtp(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """devfactor #18019: with spec decoding (MTP) the last PP rank broadcasts a
-    SINGLE bundled [num_reqs, 1 + num_spec] tensor = [confirmed_token | drafts].
-    Column 0 is the confirmed token (earlier ranks' next input); columns
-    1..num_spec are the draft tokens earlier ranks need to fill their spec input
-    positions (they have no local drafter). One fixed-shape collective avoids any
-    deadlock from a send/recv count mismatch."""
+    """devfactor #18019 / bug #6: with spec decoding (MTP) the last PP rank
+    broadcasts a SINGLE bundled [num_reqs, 2 + num_spec] tensor =
+    [confirmed_token | valid_count | drafts]. Column 0 is the confirmed token
+    (earlier ranks' next input); column 1 is the per-request valid-sampled-token
+    count (= 1 + accepted) earlier ranks need to run the same num_computed_tokens
+    correction the last rank runs (without it their forward positions drift ahead
+    by the rejected-draft count and the output degrades); columns 2..(1+num_spec)
+    are the draft tokens earlier ranks need to fill their spec input positions
+    (they have no local drafter). One fixed-shape collective avoids any deadlock
+    from a send/recv count mismatch."""
     runner = GPUModelRunner.__new__(GPUModelRunner)
     num_reqs, num_spec = 3, 3
     runner.num_spec_tokens = num_spec
@@ -319,10 +323,12 @@ def test_pp_broadcast_bundles_confirmed_and_draft_tokens_for_mtp(
     drafts = torch.arange(100, 100 + num_reqs * num_spec, dtype=torch.int32).reshape(
         num_reqs, num_spec
     )
+    accepted = torch.tensor([1, 2, 3], dtype=torch.int32)
     runner.input_batch = SimpleNamespace(
         prev_sampled_token_ids=confirmed, num_reqs=num_reqs
     )
     runner._draft_token_ids = drafts
+    runner.num_accepted_tokens = SimpleNamespace(gpu=accepted)
     runner._is_all_reqs_still_prefilling = lambda: False
 
     monkeypatch.setattr(
@@ -340,11 +346,12 @@ def test_pp_broadcast_bundles_confirmed_and_draft_tokens_for_mtp(
     GPUModelRunner._pp_broadcast_prev_sampled_token_ids(runner)
 
     sent = captured["tensor"]
-    assert sent.shape == (num_reqs, 1 + num_spec)
+    assert sent.shape == (num_reqs, 2 + num_spec)
     assert sent.dtype == torch.int32
     assert sent.is_contiguous()
     assert torch.equal(sent[:, :1], confirmed)  # confirmed token in column 0
-    assert torch.equal(sent[:, 1:], drafts)  # drafts in the rest
+    assert torch.equal(sent[:, 1], accepted)  # valid-sampled-token count in col 1
+    assert torch.equal(sent[:, 2:], drafts)  # drafts in the rest
 
 
 def test_pp_broadcast_sends_zeros_when_no_data(
@@ -359,6 +366,9 @@ def test_pp_broadcast_sends_zeros_when_no_data(
     runner.device = torch.device("cpu")
     runner.input_batch = SimpleNamespace(prev_sampled_token_ids=None, num_reqs=num_reqs)
     runner._draft_token_ids = None
+    runner.num_accepted_tokens = SimpleNamespace(
+        gpu=torch.zeros(num_reqs, dtype=torch.int32)
+    )
     runner._is_all_reqs_still_prefilling = lambda: False
 
     monkeypatch.setattr(
@@ -376,8 +386,136 @@ def test_pp_broadcast_sends_zeros_when_no_data(
     GPUModelRunner._pp_broadcast_prev_sampled_token_ids(runner)
 
     sent = captured["tensor"]
-    assert sent.shape == (num_reqs, 1 + num_spec)  # still broadcasts (no deadlock)
-    assert torch.equal(sent, torch.zeros((num_reqs, 1 + num_spec), dtype=torch.int32))
+    assert sent.shape == (num_reqs, 2 + num_spec)  # still broadcasts (no deadlock)
+    assert torch.equal(sent, torch.zeros((num_reqs, 2 + num_spec), dtype=torch.int32))
+
+
+def test_pp_receive_applies_valid_count_for_num_computed_correction(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """bug #6: an earlier PP rank has no sampler, so under async spec decode it
+    cannot compute the per-request valid-sampled-token count the last rank uses
+    to correct num_computed_tokens (the scheduler feeds an OPTIMISTIC all-accepted
+    count). The receive side must (1) stash column 1 into
+    `valid_sampled_token_count_gpu` so `_prepare_inputs` runs the same on-GPU
+    correction, (2) read drafts from column 2+, and (3) build
+    `prev_req_id_to_index` from the rank-invariant valid count (== 0 ⟺ discarded)
+    rather than the drift-prone `discard_request_mask`. A request with valid
+    count >= 1 must stay in the map; only a 0 count drops it."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    num_reqs, num_spec = 2, 3
+    runner.num_spec_tokens = num_spec
+    runner.device = torch.device("cpu")
+    runner.use_async_spec_decode = True
+    runner._draft_token_ids = None
+    runner._pp_recv_draft_by_req_id = {}
+    runner.requests = {}
+    runner.valid_sampled_token_count_gpu = None
+    runner._is_all_reqs_still_prefilling = lambda: False
+
+    confirmed = torch.tensor([[7], [8]], dtype=torch.int32)
+    valid_count = torch.tensor([2, 1], dtype=torch.int32)  # both continuing
+    drafts = torch.arange(100, 100 + num_reqs * num_spec, dtype=torch.int32).reshape(
+        num_reqs, num_spec
+    )
+
+    runner.input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        req_ids=["r0", "r1"],
+        num_accepted_tokens_cpu=np.full(num_reqs, 1 + num_spec, dtype=np.int32),
+        prev_sampled_token_ids=None,
+        prev_req_id_to_index=None,
+        num_tokens_no_spec=np.zeros(num_reqs, dtype=np.int32),
+        is_token_ids=np.zeros((num_reqs, 8), dtype=bool),
+    )
+    # discard_request_mask is DRIFTED (wrongly marks r1 discarded) — the receive
+    # must ignore it and use the broadcast valid count instead, keeping r1.
+    runner.discard_request_mask = SimpleNamespace(
+        np=np.array([False, True], dtype=bool)
+    )
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False, last_rank=1, device_group=object()),
+    )
+
+    def fake_broadcast(tensor, src, group):
+        tensor[:, :1] = confirmed
+        tensor[:, 1] = valid_count
+        tensor[:, 2:] = drafts
+
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+
+    GPUModelRunner._pp_receive_prev_sampled_token_ids_to_input_batch(runner)
+
+    # (1) valid count stashed for the GPU num_computed correction.
+    assert runner.valid_sampled_token_count_gpu is not None
+    assert torch.equal(runner.valid_sampled_token_count_gpu, valid_count)
+    # (2) drafts read from column 2+, confirmed token from column 0.
+    assert torch.equal(runner._draft_token_ids, drafts)
+    assert torch.equal(runner.input_batch.prev_sampled_token_ids, confirmed)
+    # (3) prev_req_id_to_index uses the rank-invariant valid count: r1 has count
+    # 1 (continuing) so it STAYS in the map despite the drifted discard mask.
+    assert runner.input_batch.prev_req_id_to_index == {"r0": 0, "r1": 1}
+
+
+def test_pp_receive_drops_request_with_zero_valid_count(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """bug #6: a valid count of 0 in column 1 means the LAST RANK discarded that
+    request when sampling (rank-invariant signal). The receive side must drop it
+    from `prev_req_id_to_index` so the next step treats it as new (prev_pos=-1),
+    matching the last rank's own map build."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    num_reqs, num_spec = 2, 3
+    runner.num_spec_tokens = num_spec
+    runner.device = torch.device("cpu")
+    runner.use_async_spec_decode = True
+    runner._draft_token_ids = None
+    runner._pp_recv_draft_by_req_id = {}
+    runner.requests = {}
+    runner.valid_sampled_token_count_gpu = None
+    runner._is_all_reqs_still_prefilling = lambda: False
+
+    confirmed = torch.tensor([[7], [8]], dtype=torch.int32)
+    valid_count = torch.tensor([2, 0], dtype=torch.int32)  # r1 discarded
+    drafts = torch.arange(100, 100 + num_reqs * num_spec, dtype=torch.int32).reshape(
+        num_reqs, num_spec
+    )
+
+    runner.input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        req_ids=["r0", "r1"],
+        num_accepted_tokens_cpu=np.full(num_reqs, 1 + num_spec, dtype=np.int32),
+        prev_sampled_token_ids=None,
+        prev_req_id_to_index=None,
+        num_tokens_no_spec=np.zeros(num_reqs, dtype=np.int32),
+        is_token_ids=np.zeros((num_reqs, 8), dtype=bool),
+    )
+    # discard_request_mask says NOTHING is discarded — the receive must use the
+    # broadcast valid count (r1 == 0) and drop r1 anyway.
+    runner.discard_request_mask = SimpleNamespace(
+        np=np.array([False, False], dtype=bool)
+    )
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False, last_rank=1, device_group=object()),
+    )
+
+    def fake_broadcast(tensor, src, group):
+        tensor[:, :1] = confirmed
+        tensor[:, 1] = valid_count
+        tensor[:, 2:] = drafts
+
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+
+    GPUModelRunner._pp_receive_prev_sampled_token_ids_to_input_batch(runner)
+
+    # r1 (valid count 0) dropped; r0 kept.
+    assert runner.input_batch.prev_req_id_to_index == {"r0": 0}
 
 
 def test_pp_broadcast_skip_guard_is_rank_invariant_under_spec_drift():
