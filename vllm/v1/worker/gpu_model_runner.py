@@ -3979,6 +3979,30 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _is_all_reqs_still_prefilling(self) -> bool:
+        """Rank-invariant version of `_is_all_reqs_chunked_prefill` for the PP
+        broadcast skip decision.
+
+        devfactor #18019: `discard_request_mask` is derived from
+        `requests[r].num_tokens` (prompt + output), whose output part DRIFTS
+        between PP ranks under MTP spec decode — earlier ranks (no drafter)
+        advance their local output count via -1 placeholders while the last
+        rank uses the real acceptance. So `_is_all_reqs_chunked_prefill()` can
+        evaluate differently on each rank for the same step, making one rank
+        broadcast while the peer skips → NCCL deadlock.
+
+        The PP broadcast must be skipped iff *no* request samples this step,
+        i.e. every request is still prefilling: `optimistic_seq_len
+        (= num_computed + num_scheduled) < num_prompt_tokens`. Both operands are
+        prompt-only / scheduler-derived and therefore IDENTICAL across ranks, so
+        send and receive always agree."""
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            return False
+        optimistic = self.optimistic_seq_lens_cpu[:num_reqs].numpy()
+        num_prompt = self.input_batch.num_prompt_tokens[:num_reqs]
+        return bool((optimistic < num_prompt).all())
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4661,8 +4685,11 @@ class GPUModelRunner(
             draft = self._draft_token_ids.to(dtype=torch.int32)
             bundle[:, 1 : 1 + num_spec] = draft[:, :num_spec]
         # Skip for chunked prefill: sampled tokens are dummy
-        # and will be discarded, no need to broadcast.
-        if not self._is_all_reqs_chunked_prefill():
+        # and will be discarded, no need to broadcast. devfactor #18019: use the
+        # rank-invariant prefill check (NOT `_is_all_reqs_chunked_prefill`, whose
+        # `discard_request_mask` drifts between PP ranks under MTP) so send and
+        # receive always agree on whether the collective happens.
+        if not self._is_all_reqs_still_prefilling():
             torch.distributed.broadcast(
                 bundle.contiguous(), src=pp.rank, group=pp.device_group
             )
@@ -4680,8 +4707,9 @@ class GPUModelRunner(
             (num_reqs, 1 + num_spec), dtype=torch.int32, device=self.device
         )
         recv = bundle[:, :1]
-        # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
+        # skip for chunked prefill. devfactor #18019: rank-invariant prefill
+        # check — must match the send side's guard exactly (see send side).
+        if not self._is_all_reqs_still_prefilling():
             torch.distributed.broadcast(bundle, src=pp.last_rank, group=pp.device_group)
             recv = bundle[:, :1].contiguous()
             if num_spec:

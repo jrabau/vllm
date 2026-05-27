@@ -323,7 +323,7 @@ def test_pp_broadcast_bundles_confirmed_and_draft_tokens_for_mtp(
         prev_sampled_token_ids=confirmed, num_reqs=num_reqs
     )
     runner._draft_token_ids = drafts
-    runner._is_all_reqs_chunked_prefill = lambda: False
+    runner._is_all_reqs_still_prefilling = lambda: False
 
     monkeypatch.setattr(
         gpu_model_runner_module,
@@ -359,7 +359,7 @@ def test_pp_broadcast_sends_zeros_when_no_data(
     runner.device = torch.device("cpu")
     runner.input_batch = SimpleNamespace(prev_sampled_token_ids=None, num_reqs=num_reqs)
     runner._draft_token_ids = None
-    runner._is_all_reqs_chunked_prefill = lambda: False
+    runner._is_all_reqs_still_prefilling = lambda: False
 
     monkeypatch.setattr(
         gpu_model_runner_module,
@@ -378,6 +378,53 @@ def test_pp_broadcast_sends_zeros_when_no_data(
     sent = captured["tensor"]
     assert sent.shape == (num_reqs, 1 + num_spec)  # still broadcasts (no deadlock)
     assert torch.equal(sent, torch.zeros((num_reqs, 1 + num_spec), dtype=torch.int32))
+
+
+def test_pp_broadcast_skip_guard_is_rank_invariant_under_spec_drift():
+    """devfactor #18019: the PP broadcast skip guard must depend ONLY on
+    rank-invariant quantities (prompt length + scheduler-driven computed/
+    scheduled tokens), NEVER on `discard_request_mask`/`requests[r].num_tokens`
+    whose OUTPUT part drifts between PP ranks under MTP spec decode. If it did,
+    one rank would broadcast while its peer skips → NCCL deadlock (the bug this
+    regression test guards). Here both ranks see the same prompt length and the
+    same optimistic seq len yet a DIFFERENT discard mask; the guard must agree."""
+    num_reqs, num_spec = 1, 3
+    prompt_len = 5
+
+    def make_runner(discard_value: bool):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.num_spec_tokens = num_spec
+        # Decode step: optimistic_seq_len (computed + scheduled) >= prompt_len,
+        # so the request is NOT still prefilling -> guard must be False on BOTH
+        # ranks, regardless of the (drifting) discard mask below.
+        runner.optimistic_seq_lens_cpu = torch.tensor(
+            [prompt_len + 2], dtype=torch.int32
+        )
+        runner.input_batch = SimpleNamespace(
+            num_reqs=num_reqs,
+            num_prompt_tokens=np.array([prompt_len], dtype=np.int32),
+        )
+        # discard_request_mask DIFFERS between ranks — the drift the old guard
+        # tripped on. The new guard must ignore it entirely.
+        runner.discard_request_mask = SimpleNamespace(
+            np=np.array([discard_value], dtype=bool)
+        )
+        return runner
+
+    last_rank = make_runner(discard_value=False)  # PP1 saw real acceptance
+    early_rank = make_runner(discard_value=True)  # PP0 drifted via -1 placeholder
+
+    # Old (buggy) guard would diverge: True on PP0, False on PP1.
+    assert (
+        GPUModelRunner._is_all_reqs_chunked_prefill(early_rank)
+        != GPUModelRunner._is_all_reqs_chunked_prefill(last_rank)
+    )
+    # New guard agrees on both ranks (both: still-prefilling == False -> broadcast).
+    assert (
+        GPUModelRunner._is_all_reqs_still_prefilling(early_rank)
+        == GPUModelRunner._is_all_reqs_still_prefilling(last_rank)
+        is False
+    )
 
 
 def test_select_common_block_size_no_valid_option():
