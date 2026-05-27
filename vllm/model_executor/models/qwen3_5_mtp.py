@@ -10,7 +10,6 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -18,7 +17,6 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -73,19 +71,18 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
-        # devfactor P4 (MTP+PP): embed_tokens (here ~2.37 GiB for Qwen3.6) is only
-        # used in forward() on the first PP rank (to embed the draft tokens before
-        # the fc concat). On other ranks it is dead weight. Under PP it landed
-        # whole on the LAST rank (where the drafter lives) and OOM'd a 16 GiB GPU.
-        # Instantiate it only on the first rank (PPMissingLayer elsewhere), matching
-        # the target model's layout. See docs/vllm-mtp-pipeline-parallel-plan.md (A3).
-        if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                self.vocab_size,
-                config.hidden_size,
-            )
-        else:
-            self.embed_tokens = PPMissingLayer()
+        # devfactor P4 (MTP+PP): the MTP draft model runs ENTIRELY on the last PP
+        # rank (see gpu_model_runner.py drafter creation). It re-embeds the draft
+        # tokens, which are only known on the last rank (sampled there) — so the
+        # embedding table MUST live on the last rank. The target's embed_tokens
+        # sits on the FIRST rank under PP and is not reachable here, so the MTP
+        # keeps its OWN embed_tokens (~2.37 GiB). This fits now that the lm_head
+        # is shared from the target (freeing the other ~2.37 GiB that OOM'd a
+        # 16 GiB GPU). See docs/vllm-mtp-pipeline-parallel-plan.md (Étape A4).
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            config.hidden_size,
+        )
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
@@ -139,19 +136,23 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_input_ids(input_ids)
-            assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+        # devfactor P4 (MTP+PP): the MTP draft model runs ENTIRELY on the last
+        # PP rank, so it is never pipeline-split — always execute the full path
+        # (embed + fc concat + decoder layer + norm). The upstream code gated
+        # this on get_pp_group().is_first_rank/is_last_rank, which references the
+        # GLOBAL PP group; under PP=2 the drafter lives on the last rank where
+        # is_first_rank is False, sending it down the else-branch that asserts on
+        # intermediate_tensors the drafter never passes. The drafter always
+        # supplies hidden_states and input_ids/inputs_embeds.
+        # See docs/vllm-mtp-pipeline-parallel-plan.md (Étape A4).
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
+        residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         hidden_states, residual = self.layers[current_step_idx](
@@ -159,11 +160,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states=hidden_states,
             residual=residual,
         )
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -390,17 +386,14 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
-        if get_pp_group().is_last_rank:
-            if config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    prefix=maybe_prefix(prefix, "lm_head"),
-                )
-        else:
-            self.lm_head = PPMissingLayer()
+        # devfactor P4 (MTP+PP): never allocate the MTP's own lm_head. For MTP,
+        # the head is ALWAYS shared from the target model (_maybe_share_lm_head),
+        # and the checkpoint carries no dedicated head. Eagerly allocating it
+        # (here ~2.37 GiB) on the last rank — on top of the target's own lm_head
+        # already resident there — OOM'd a 16 GiB GPU at construction, before
+        # sharing could free it. PPMissingLayer is replaced post-load by the
+        # target's lm_head. See docs/vllm-mtp-pipeline-parallel-plan.md (A4).
+        self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
 

@@ -50,6 +50,34 @@ from vllm.v1.kv_offload.tiering.manager import (
 logger = init_logger(__name__)
 
 
+def _check_block_sizes(
+    gpu_block_size: tuple[int, ...], block_size_factor: int
+) -> None:
+    """Validate the GPU block sizes before building the tiering manager.
+
+    Hybrid (attention+Mamba) models expose >1 distinct gpu_block_size. That is
+    fine here: gpu_block_size is not read past this point — the primary tier
+    uses num_blocks (aggregate) and the secondary tiers derive their block size
+    from ``primary_kv_view.strides[0]``, both independent of gpu_block_size.
+
+    The only path that genuinely needs a single block size is an explicit
+    ``extra_config["block_size"]`` (which makes ``block_size_factor > 1``). That
+    case is already rejected for multi-size models upstream (base.py:379, at
+    spec __init__), and any residual byte-size mismatch is caught at boot by the
+    SharedOffloadRegion overflow check. So we only assert the genuinely
+    dangerous case here.
+
+    (devfactor: replaces an unconditional ``assert len(gpu_block_size) == 1``
+    that previously blocked the disk tier on hybrid models.)
+    """
+    if len(set(gpu_block_size)) != 1:
+        assert block_size_factor == 1, (
+            "Hybrid models with >1 distinct gpu_block_size require "
+            "block_size_factor == 1 (do not set 'block_size' in "
+            "kv_connector_extra_config)."
+        )
+
+
 class TieringOffloadingSpec(CPUOffloadingSpec):
     """
     Spec for multi-tier KV cache offloading.
@@ -109,8 +137,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             )
             self._scheduler_mmap = scheduler_mmap
 
-            # Create primary tier (CPU-based)
-            assert len(self.gpu_block_size) == 1
+            # Create primary tier (CPU-based).
+            _check_block_sizes(self.gpu_block_size, self.block_size_factor)
             primary_tier = CPUPrimaryTierOffloadingManager(
                 num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,  # type: ignore[arg-type]

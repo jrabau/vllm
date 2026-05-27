@@ -481,7 +481,10 @@ class InputBatch:
         return req_index
 
     def update_req_spec_token_ids(
-        self, request: CachedRequestState, scheduled_spec_tokens: dict[str, list[int]]
+        self,
+        request: CachedRequestState,
+        scheduled_spec_tokens: dict[str, list[int]],
+        pp_recv_draft_by_req_id: dict[str, list[int]] | None = None,
     ) -> None:
         req_id = request.req_id
         req_index = self.req_id_to_index[req_id]
@@ -497,6 +500,16 @@ class InputBatch:
         request.prev_num_draft_len = num_spec_tokens
         if not spec_token_ids:
             return
+
+        # devfactor #18019: on non-last PP ranks the scheduler ships -1
+        # placeholders (the real drafts live only on the last rank). Replace them
+        # with the values broadcast from the last rank so `token_ids_cpu` — and
+        # thus every `_prepare_input_ids` path — holds valid token ids. Trim to
+        # the scheduled count (the scheduler may have dropped some drafts).
+        if pp_recv_draft_by_req_id is not None:
+            recv = pp_recv_draft_by_req_id.get(req_id)
+            if recv:
+                spec_token_ids = recv[:num_spec_tokens]
 
         # For async scheduling, token_ids_cpu assigned from
         # spec_token_ids are placeholders and will be overwritten in

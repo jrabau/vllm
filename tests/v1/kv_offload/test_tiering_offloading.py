@@ -27,6 +27,7 @@ from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
+from vllm.v1.kv_offload.tiering.spec import _check_block_sizes
 
 _CTX = ReqContext(req_id="test")
 _MOCK_OFFLOADING_SPEC = MagicMock()
@@ -411,6 +412,36 @@ class TestTieringOffloadingManager:
         assert self.secondary_tier1.submit_store.call_count == 1
         job_metadata = self.secondary_tier1.submit_store.call_args.args[0]
         assert job_metadata.req_context is ctx
+
+
+class TestCheckBlockSizes:
+    """Guard that lets the tiering path build on hybrid (multi-block-size) models.
+
+    devfactor: replaces a previously unconditional ``assert
+    len(gpu_block_size) == 1`` that blocked the disk tier on attention+Mamba
+    models (which expose 2 distinct GPU block sizes).
+    """
+
+    def test_single_block_size_passes(self):
+        # Non-hybrid model: one block size. Unchanged behavior, no raise.
+        _check_block_sizes(gpu_block_size=(16,), block_size_factor=1)
+
+    def test_hybrid_two_block_sizes_with_factor_1_passes(self):
+        # Hybrid attention+Mamba: 2 distinct sizes. With the default
+        # block_size_factor==1 (no explicit extra_config["block_size"]), the
+        # tiering manager must be allowed to build — this is the unblock.
+        _check_block_sizes(gpu_block_size=(16, 256), block_size_factor=1)
+
+    def test_hybrid_with_block_size_factor_gt_1_still_raises(self):
+        # The only genuinely dangerous case: multiple block sizes AND an
+        # explicit offloaded block_size (factor>1). Must still be rejected.
+        with pytest.raises(AssertionError, match="block_size_factor == 1"):
+            _check_block_sizes(gpu_block_size=(16, 256), block_size_factor=2)
+
+    def test_single_block_size_with_factor_gt_1_passes(self):
+        # A single block size with a larger offloaded block (factor>1) is the
+        # supported coalescing case and must not raise.
+        _check_block_sizes(gpu_block_size=(16,), block_size_factor=4)
 
 
 class TestTieringOffloadingWithoutSecondaryTiers:

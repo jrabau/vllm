@@ -694,7 +694,19 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
                     )
-                    if num_new_tokens == 0:
+                    # NOTE(kv-offload+HMA, issue #41515): num_new_tokens == 0 is
+                    # NOT a "cannot schedule" condition when an async KV load is
+                    # pending (load_kv_async). For an offloaded-prefix hit the
+                    # connector returns load_kv_async=True and the WAITING path
+                    # below deliberately sets num_new_tokens = 0 (line ~677) so
+                    # that this step only kicks off the async CPU->GPU load and
+                    # transitions the request to WAITING_FOR_REMOTE_KVS (line
+                    # ~795); the prefill resumes on a later step. Breaking here
+                    # short-circuits that setup, the load is never started,
+                    # request.num_computed_tokens never advances, and the request
+                    # re-enters the WAITING queue every step forever (livelock).
+                    # Only break for the genuine non-async case.
+                    if num_new_tokens == 0 and not load_kv_async:
                         break
 
                 # Handles an edge case when P/D Disaggregation

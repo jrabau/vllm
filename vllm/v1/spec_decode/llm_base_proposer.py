@@ -1277,6 +1277,14 @@ class SpecDecodeBaseProposer:
         we share the target model's embedding layers with the draft model to save
         memory.
         """
+        # devfactor P4 (MTP+PP): under PP the MTP draft lives entirely on the
+        # last rank, where the target's embed_tokens is NOT resident (it sits on
+        # the first rank). The draft tokens are also only known on the last rank
+        # (sampled there), so embedding cannot be delegated to the first rank
+        # without a per-step round-trip on the slow inter-GPU link. We therefore
+        # keep the upstream behaviour: only share embeddings when the whole model
+        # is on one rank (world_size == 1); under PP the MTP loads its own
+        # embed_tokens. See docs/vllm-mtp-pipeline-parallel-plan.md (Étape A4).
         if get_pp_group().world_size == 1:
             inner_model = getattr(target_language_model, "model", None)
             if inner_model is None:

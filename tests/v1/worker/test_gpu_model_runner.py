@@ -302,6 +302,84 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
     assert GPUModelRunner.sample_tokens(runner, None) is None
 
 
+def test_pp_broadcast_bundles_confirmed_and_draft_tokens_for_mtp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """devfactor #18019: with spec decoding (MTP) the last PP rank broadcasts a
+    SINGLE bundled [num_reqs, 1 + num_spec] tensor = [confirmed_token | drafts].
+    Column 0 is the confirmed token (earlier ranks' next input); columns
+    1..num_spec are the draft tokens earlier ranks need to fill their spec input
+    positions (they have no local drafter). One fixed-shape collective avoids any
+    deadlock from a send/recv count mismatch."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    num_reqs, num_spec = 3, 3
+    runner.num_spec_tokens = num_spec
+    runner.device = torch.device("cpu")
+    confirmed = torch.arange(num_reqs, dtype=torch.int32).reshape(num_reqs, 1)
+    drafts = torch.arange(100, 100 + num_reqs * num_spec, dtype=torch.int32).reshape(
+        num_reqs, num_spec
+    )
+    runner.input_batch = SimpleNamespace(
+        prev_sampled_token_ids=confirmed, num_reqs=num_reqs
+    )
+    runner._draft_token_ids = drafts
+    runner._is_all_reqs_chunked_prefill = lambda: False
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True, rank=1, device_group=object()),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        torch.distributed,
+        "broadcast",
+        lambda tensor, src, group: captured.update(tensor=tensor),
+    )
+
+    GPUModelRunner._pp_broadcast_prev_sampled_token_ids(runner)
+
+    sent = captured["tensor"]
+    assert sent.shape == (num_reqs, 1 + num_spec)
+    assert sent.dtype == torch.int32
+    assert sent.is_contiguous()
+    assert torch.equal(sent[:, :1], confirmed)  # confirmed token in column 0
+    assert torch.equal(sent[:, 1:], drafts)  # drafts in the rest
+
+
+def test_pp_broadcast_sends_zeros_when_no_data(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """devfactor #18019: even with no confirmed token / no drafter output this
+    step, the last rank must STILL broadcast a (zeros) bundle so the receiver's
+    matching broadcast does not deadlock. The collective must stay balanced."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    num_reqs, num_spec = 2, 3
+    runner.num_spec_tokens = num_spec
+    runner.device = torch.device("cpu")
+    runner.input_batch = SimpleNamespace(prev_sampled_token_ids=None, num_reqs=num_reqs)
+    runner._draft_token_ids = None
+    runner._is_all_reqs_chunked_prefill = lambda: False
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True, rank=1, device_group=object()),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        torch.distributed,
+        "broadcast",
+        lambda tensor, src, group: captured.update(tensor=tensor),
+    )
+
+    GPUModelRunner._pp_broadcast_prev_sampled_token_ids(runner)
+
+    sent = captured["tensor"]
+    assert sent.shape == (num_reqs, 1 + num_spec)  # still broadcasts (no deadlock)
+    assert torch.equal(sent, torch.zeros((num_reqs, 1 + num_spec), dtype=torch.int32))
+
+
 def test_select_common_block_size_no_valid_option():
     backend_a = _make_mock_backend_for_kernel_block_size([64])
     backend_b = _make_mock_backend_for_kernel_block_size([MultipleOf(16)])

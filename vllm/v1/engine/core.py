@@ -222,6 +222,18 @@ class EngineCore:
 
         self._idle_state_callbacks: list[Callable] = []
 
+        # Optional idle-driven KV-cache VRAM release. The controller lives in the
+        # external `devfactor_vllm` plugin package and starts only when
+        # VLLM_IDLE_VRAM_RELEASE_S > 0; absent package or env => no-op. Guarded so
+        # vanilla vLLM (no plugin installed) is completely unaffected.
+        self._idle_vram = None
+        try:
+            from devfactor_vllm.engine.idle_vram import maybe_start_idle_vram
+
+            self._idle_vram = maybe_start_idle_vram(self)
+        except ImportError:
+            pass
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
@@ -340,6 +352,11 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        # Auto-wake from idle-released KV VRAM BEFORE the scheduler touches any
+        # KV blocks (which don't exist while slept). Synchronous on this path.
+        if self._idle_vram is not None:
+            self._idle_vram.wake_if_sleeping()
+
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -595,6 +612,8 @@ class EngineCore:
             self.abort_requests(request_ids)
 
     def shutdown(self):
+        if self._idle_vram is not None:
+            self._idle_vram.shutdown()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1236,6 +1255,10 @@ class EngineCoreProc(EngineCore):
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
+        # Record activity ONLY when the model actually ran. Empty/polling steps
+        # must not reset the idle clock, or the engine would never go idle.
+        if model_executed and self._idle_vram is not None:
+            self._idle_vram.note_activity()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
